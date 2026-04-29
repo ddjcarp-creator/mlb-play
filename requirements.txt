@@ -1,9 +1,7 @@
-pip
-install
 streamlit
 pybaseball
 pandas
 numpy
-plotly 
 scikit-learn
 joblib
+plotly
