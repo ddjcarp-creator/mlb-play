@@ -1,7 +1,7 @@
 streamlit
+pybaseball
 pandas
 numpy
-pybaseball
-seaborn
-matplotlib
-requests
+scikit-learn
+joblib
+plotly
