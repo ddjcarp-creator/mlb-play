@@ -4,36 +4,48 @@ import numpy as np
 import joblib
 import os
 
+from pybaseball import statcast
+from sklearn.ensemble import RandomForestClassifier
 import plotly.express as px
 import plotly.graph_objects as go
 
-from pybaseball import statcast_batter, statcast_pitcher
+# ----------------------------
+# APP CONFIG
+# ----------------------------
+st.set_page_config(page_title="MLB Savant-Lite 2.0", layout="wide")
 
-from sklearn.ensemble import RandomForestClassifier
+st.title("⚾ MLB Savant-Lite 2.0 (Stable Version)")
+st.caption("Statcast-powered MLB analytics + ML home run model")
 
 # ----------------------------
-# PAGE CONFIG
+# SAFE DATA LOADING (FIXED CORE)
 # ----------------------------
-st.set_page_config(page_title="MLB Savant-Lite", layout="wide")
+@st.cache_data(show_spinner=True)
+def load_statcast():
+    # small range for stability (expand later if self-hosting)
+    df = statcast("2024-04-01", "2024-04-07")
+    
+    # clean
+    df = df.dropna(subset=["launch_speed", "launch_angle"])
+    return df
 
-st.title("⚾ MLB Savant-Lite: Pitcher vs Batter Intelligence System")
 
-st.caption("Statcast-powered analytics + ML-driven HR probability + visual dashboards")
+data = load_statcast()
 
 # ----------------------------
-# MODEL (UPGRADED FROM LOGISTIC REGRESSION)
+# MODEL (SAFE TRAINING)
 # ----------------------------
 MODEL_PATH = "hr_model.pkl"
 
 @st.cache_resource
-def train_model():
-    data = statcast_batter("2024-04-01", "2024-10-01")
-    data = data.dropna(subset=["launch_speed", "launch_angle", "home_run"])
+def train_model(df):
+    df = df.copy()
+    df["home_run"] = (df["events"] == "home_run").astype(int)
 
-    X = data[["launch_speed", "launch_angle"]]
-    y = data["home_run"]
+    X = df[["launch_speed", "launch_angle"]]
+    y = df["home_run"]
 
-    model = RandomForestClassifier(n_estimators=150, max_depth=6)
+    model = RandomForestClassifier(n_estimators=120, max_depth=6)
     model.fit(X, y)
 
     joblib.dump(model, MODEL_PATH)
@@ -43,171 +55,142 @@ def train_model():
 if os.path.exists(MODEL_PATH):
     model = joblib.load(MODEL_PATH)
 else:
-    model = train_model()
+    model = train_model(data)
 
 # ----------------------------
-# FEATURE ENGINEERING HELPERS
+# SIDEBAR INPUTS
 # ----------------------------
-def estimate_xwoba(df):
-    if df.empty:
-        return 0
-    weights = {
-        "single": 0.9,
-        "double": 1.25,
-        "triple": 1.6,
-        "home_run": 2.0
-    }
-    df["value"] = df["events"].map(weights).fillna(0)
-    return df["value"].mean()
-
-
-def barrel_rate(df):
-    if df.empty:
-        return 0
-    barrels = df[(df["launch_speed"] >= 98) & (df["launch_angle"].between(26, 30))]
-    return len(barrels) / len(df)
-
-
-def pitch_type_split(df):
-    if "pitch_type" not in df.columns:
-        return {}
-    return df["pitch_type"].value_counts(normalize=True).to_dict()
-
-# ----------------------------
-# INPUTS
-# ----------------------------
-st.sidebar.header("Player Inputs")
+st.sidebar.header("Matchup Inputs")
 
 batter_id = st.sidebar.number_input("Batter ID", value=592450)
 pitcher_id = st.sidebar.number_input("Pitcher ID", value=425844)
 
 # ----------------------------
-# LOAD DATA
+# FILTER PLAYER DATA SAFELY
 # ----------------------------
-@st.cache_data(show_spinner=False)
-def load_data(batter_id, pitcher_id):
-    batter = statcast_batter("2024-04-01", "2024-10-01", player_id=batter_id)
-    pitcher = statcast_pitcher("2024-04-01", "2024-10-01", player_id=pitcher_id)
-    return batter, pitcher
+def get_batter(df, batter_id):
+    return df[df["batter"] == batter_id]
+
+def get_pitcher(df, pitcher_id):
+    return df[df["pitcher"] == pitcher_id]
 
 
-if st.sidebar.button("Run Full Analysis"):
+batter_df = get_batter(data, batter_id)
+pitcher_df = get_pitcher(data, pitcher_id)
 
-    batter, pitcher = load_data(batter_id, pitcher_id)
+# ----------------------------
+# MATCHUP ANALYSIS
+# ----------------------------
+if st.sidebar.button("Run Analysis"):
 
-    # ----------------------------
-    # METRICS
-    # ----------------------------
-    st.header("📊 Player Profiles")
+    st.header("📊 Player Breakdown")
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.subheader("Batter Metrics")
-        st.metric("Avg EV", round(batter["launch_speed"].mean(), 2))
-        st.metric("Avg LA", round(batter["launch_angle"].mean(), 2))
-        st.metric("Barrel Rate", round(barrel_rate(batter), 3))
-        st.metric("xwOBA (est)", round(estimate_xwoba(batter), 3))
+        st.subheader("Batter")
+
+        if not batter_df.empty:
+            st.metric("Avg Exit Velocity", round(batter_df["launch_speed"].mean(), 2))
+            st.metric("Avg Launch Angle", round(batter_df["launch_angle"].mean(), 2))
+            st.metric("Barrel Rate", round(((batter_df["launch_speed"] > 98) &
+                                            (batter_df["launch_angle"].between(26, 30))).mean(), 3))
+        else:
+            st.warning("No batter data found in sample range")
 
     with col2:
-        st.subheader("Pitcher Metrics")
-        st.metric("Avg Velocity", round(pitcher["release_speed"].mean(), 2))
-        st.metric("Strikeout Rate", round((pitcher["events"] == "strikeout").mean(), 3))
-        st.metric("xSLG (est)", round(estimate_xwoba(pitcher), 3))
+        st.subheader("Pitcher")
+
+        if not pitcher_df.empty:
+            st.metric("Avg Velocity", round(pitcher_df["release_speed"].mean(), 2))
+            st.metric("Strikeout Rate", round((pitcher_df["events"] == "strikeout").mean(), 3))
+        else:
+            st.warning("No pitcher data found in sample range")
 
     with col3:
-        st.subheader("Matchup Edge Score")
+        st.subheader("Matchup Edge")
 
-        edge = batter["launch_speed"].mean() - pitcher["release_speed"].mean()
+        if not batter_df.empty and not pitcher_df.empty:
+            edge = batter_df["launch_speed"].mean() - pitcher_df["release_speed"].mean()
+            st.metric("Power Edge", round(edge, 2))
 
-        st.metric("Power Differential", round(edge, 2))
+            if edge > 5:
+                st.success("Strong hitter advantage")
+            elif edge > 0:
+                st.info("Slight hitter advantage")
+            else:
+                st.warning("Pitcher advantage")
 
-        if edge > 5:
-            st.success("Strong hitter advantage")
-        elif edge > 0:
-            st.info("Slight hitter advantage")
-        else:
-            st.warning("Pitcher advantage")
+# ----------------------------
+# HR PROBABILITY ENGINE
+# ----------------------------
+st.divider()
+st.header("⚾ Home Run Probability Model")
 
-    # ----------------------------
-    # HR PROBABILITY
-    # ----------------------------
-    st.divider()
-    st.header("⚾ Home Run Probability Engine")
+ls = st.slider("Exit Velocity", 50, 120, 95)
+la = st.slider("Launch Angle", -10, 60, 25)
 
-    ls = st.slider("Exit Velocity", 50, 120, 95)
-    la = st.slider("Launch Angle", -10, 60, 25)
+prob = model.predict_proba([[ls, la]])[0][1]
 
-    prob = model.predict_proba([[ls, la]])[0][1]
+st.metric("HR Probability", f"{prob:.3f}")
 
-    st.metric("HR Probability", f"{prob:.3f}")
+# ----------------------------
+# SPRAY CHART
+# ----------------------------
+st.divider()
+st.header("📍 Spray Chart")
 
-    # ----------------------------
-    # SPRAY CHART (SIMULATED)
-    # ----------------------------
-    st.divider()
-    st.header("📍 Spray Chart (Approximation)")
+if not batter_df.empty and "hc_x" in batter_df.columns:
 
-    if not batter.empty:
-        sample = batter.dropna(subset=["hc_x", "hc_y"]).sample(min(500, len(batter)))
+    sample = batter_df.dropna(subset=["hc_x", "hc_y"]).sample(min(300, len(batter_df)))
 
-        fig = px.scatter(
-            sample,
-            x="hc_x",
-            y="hc_y",
-            color="launch_speed",
-            title="Batted Ball Distribution",
-            color_continuous_scale="reds"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fig = px.scatter(
+        sample,
+        x="hc_x",
+        y="hc_y",
+        color="launch_speed",
+        color_continuous_scale="reds",
+        title="Batted Ball Distribution"
+    )
 
-    # ----------------------------
-    # STRIKE ZONE HEATMAP
-    # ----------------------------
-    st.header("🎯 Strike Zone Heatmap (Pitcher)")
+    st.plotly_chart(fig, use_container_width=True)
 
-    if not pitcher.empty and "plate_x" in pitcher.columns:
+# ----------------------------
+# STRIKE ZONE HEATMAP
+# ----------------------------
+st.header("🎯 Pitch Location Heatmap")
 
-        heat = pitcher.dropna(subset=["plate_x", "plate_z"])
+if not pitcher_df.empty and "plate_x" in pitcher_df.columns:
 
-        fig = go.Figure()
+    heat = pitcher_df.dropna(subset=["plate_x", "plate_z"])
 
-        fig.add_trace(go.Histogram2dContour(
-            x=heat["plate_x"],
-            y=heat["plate_z"],
-            colorscale="Blues",
-            contours=dict(showlabels=True)
-        ))
+    fig = go.Figure()
 
-        fig.update_layout(
-            title="Pitch Location Density",
-            xaxis_title="Plate X",
-            yaxis_title="Plate Z"
-        )
+    fig.add_trace(go.Histogram2dContour(
+        x=heat["plate_x"],
+        y=heat["plate_z"],
+        colorscale="Blues",
+        contours=dict(showlabels=True)
+    ))
 
-        st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        title="Pitch Location Density",
+        xaxis_title="Plate X",
+        yaxis_title="Plate Z"
+    )
 
-    # ----------------------------
-    # PITCH TYPE BREAKDOWN
-    # ----------------------------
-    st.header("⚾ Pitch Type Distribution")
+    st.plotly_chart(fig, use_container_width=True)
 
-    pitch_dist = pitch_type_split(pitcher)
+# ----------------------------
+# RAW DATA VIEW
+# ----------------------------
+st.divider()
+st.header("📦 Raw Statcast Data")
 
-    if pitch_dist:
-        fig = px.pie(values=list(pitch_dist.values()), names=list(pitch_dist.keys()))
-        st.plotly_chart(fig)
+tab1, tab2 = st.tabs(["Batter", "Pitcher"])
 
-    # ----------------------------
-    # RAW DATA
-    # ----------------------------
-    st.divider()
-    st.header("📦 Raw Data Explorer")
+with tab1:
+    st.dataframe(batter_df.head(50))
 
-    tab1, tab2 = st.tabs(["Batter Data", "Pitcher Data"])
-
-    with tab1:
-        st.dataframe(batter.head(50))
-
-    with tab2:
-        st.dataframe(pitcher.head(50))
+with tab2:
+    st.dataframe(pitcher_df.head(50))
