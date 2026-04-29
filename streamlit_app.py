@@ -1,18 +1,19 @@
-import streamlit as st
+
+        import streamlit as st
 import pandas as pd
 import datetime
 import seaborn as sns
 import matplotlib.pyplot as plt
+import requests
 from pybaseball import statcast
 
 # ------------------------------------
-# Streamlit page config
+# Page Config
 # ------------------------------------
 st.set_page_config(
     page_title="MLB Statcast Dashboard",
     page_icon="⚾",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 st.title("⚾ MLB Statcast Dashboard")
@@ -20,68 +21,85 @@ st.title("⚾ MLB Statcast Dashboard")
 today = datetime.date.today()
 yesterday = today - datetime.timedelta(days=1)
 
+# ------------------------------------
+# Caching Functions
+# ------------------------------------
+@st.cache_data(ttl=3600)
+def get_statcast_data(start_date, end_date):
+    try:
+        return statcast(start_dt=start_date, end_dt=end_date)
+    except Exception as e:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def get_matchups(date):
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date.strftime('%Y-%m-%d')}&hydrate=probablePitcher"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
+    return {}
+
+# ------------------------------------
+# Tabs
+# ------------------------------------
 tabs = st.tabs([
     "Matchups",
     "Hitters",
     "Pitchers",
-    "Zone Heatmaps",
+    "Heatmaps",
     "Rolling xwOBA",
-    "Home Run Analyzer"
+    "Home Runs"
 ])
 
 # ------------------------------------
-# Utility: fetch Statcast data
-# ------------------------------------
-@st.cache_data
-def get_statcast_data(start_date, end_date):
-    """Query Statcast data safely and cache results."""
-    try:
-        df = statcast(start_dt=start_date, end_dt=end_date)
-        return df
-    except Exception as e:
-        st.error(f"Failed to load Statcast data: {e}")
-        return pd.DataFrame()
-
-# ------------------------------------
-# Tab 1: Matchups (simplified)
+# Matchups Tab
 # ------------------------------------
 with tabs[0]:
-    st.subheader("Probable Pitchers and Matchups")
-    date = st.date_input("Game Date", yesterday)
-    try:
-        url = f"[statsapi.mlb.com](https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date.strftime()'%Y-%m-%d')}&hydrate=probablePitcher"
-        data = pd.read_json(url)
-    except Exception:
-        st.warning("Could not load matchup data.")
-        data = pd.DataFrame()
+    st.subheader("Probable Pitchers")
 
-    if not data.empty:
-        matchups = []
-        for day in data.get("dates", []):
-            for game in day.get("games", []):
-                away = game["teams"]["away"]["team"]["name"]
-                home = game["teams"]["home"]["team"]["name"]
-                away_p = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
-                home_p = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
-                matchups.append({"Matchup": f"{away} @ {home}", "Away Pitcher": away_p, "Home Pitcher": home_p})
+    date = st.date_input("Select Date", yesterday)
+
+    with st.spinner("Loading matchups..."):
+        data = get_matchups(date)
+
+    matchups = []
+    for day in data.get("dates", []):
+        for game in day.get("games", []):
+            away = game["teams"]["away"]["team"]["name"]
+            home = game["teams"]["home"]["team"]["name"]
+
+            away_p = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
+            home_p = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
+
+            matchups.append({
+                "Matchup": f"{away} @ {home}",
+                "Away Pitcher": away_p,
+                "Home Pitcher": home_p
+            })
+
+    if matchups:
         st.dataframe(pd.DataFrame(matchups), use_container_width=True)
     else:
-        st.info("No games found or MLB API unavailable today.")
+        st.info("No games found.")
 
 # ------------------------------------
-# Tab 2: Hitters
+# Hitters Tab
 # ------------------------------------
 with tabs[1]:
-    st.subheader("Recent Hitter Performance (Last 30 Days)")
-    start = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
+    st.subheader("Hitter Performance (Last 30 Days)")
 
-    df = get_statcast_data(start, end)
+    df = get_statcast_data(
+        (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d"),
+        today.strftime("%Y-%m-%d")
+    )
+
     if not df.empty:
-        hitter_stats = (
+        hitters = (
             df.groupby("player_name")[["launch_speed", "launch_angle", "estimated_woba_using_speedangle"]]
             .mean()
-            .round(2)
             .rename(columns={
                 "launch_speed": "Avg EV",
                 "launch_angle": "Avg LA",
@@ -89,93 +107,113 @@ with tabs[1]:
             })
             .sort_values("xwOBA", ascending=False)
         )
-        st.dataframe(
-            hitter_stats.style.background_gradient(cmap="RdYlGn_r"),
-            use_container_width=True
-        )
+
+        st.dataframe(hitters, use_container_width=True)
     else:
-        st.warning("No data available right now.")
+        st.warning("No data available.")
 
 # ------------------------------------
-# Tab 3: Pitchers
+# Pitchers Tab
 # ------------------------------------
 with tabs[2]:
-    st.subheader("Recent Pitcher Performance (Last 30 Days)")
-    start = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
+    st.subheader("Pitcher Metrics")
 
-    df = get_statcast_data(start, end)
+    df = get_statcast_data(
+        (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d"),
+        today.strftime("%Y-%m-%d")
+    )
+
     if not df.empty:
-        pitcher_stats = (
+        pitchers = (
             df.groupby("pitcher")[["release_speed", "pfx_x", "pfx_z"]]
             .mean()
             .rename(columns={
-                "release_speed": "Avg Velo (mph)",
-                "pfx_x": "Horizontal Break",
-                "pfx_z": "Vertical Break"
+                "release_speed": "Velocity",
+                "pfx_x": "H-Break",
+                "pfx_z": "V-Break"
             })
-            .sort_values("Avg Velo (mph)", ascending=False)
+            .sort_values("Velocity", ascending=False)
         )
-        st.dataframe(
-            pitcher_stats.style.background_gradient(cmap="YlOrRd_r"),
-            use_container_width=True
-        )
+
+        st.dataframe(pitchers, use_container_width=True)
     else:
-        st.warning("No data available right now.")
+        st.warning("No data available.")
 
 # ------------------------------------
-# Tab 4: Zone Heatmaps
+# Heatmaps Tab
 # ------------------------------------
 with tabs[3]:
-    st.subheader("Zone Heatmaps")
-    player = st.text_input("Enter Player Name (exactly as in Statcast)")
+    st.subheader("Pitch Location Heatmap")
+
+    player = st.text_input("Enter Player Name")
+
     if player:
-        df = get_statcast_data((today - datetime.timedelta(days=60)).strftime("%Y-%m-%d"),
-                               today.strftime("%Y-%m-%d"))
+        df = get_statcast_data(
+            (today - datetime.timedelta(days=60)).strftime("%Y-%m-%d"),
+            today.strftime("%Y-%m-%d")
+        )
+
         df = df[df["player_name"] == player]
+
         if df.empty:
-            st.warning("No matching Statcast data found.")
+            st.warning("No data found.")
         else:
             fig, ax = plt.subplots(figsize=(6, 6))
-            sns.kdeplot(x=df["plate_x"], y=df["plate_z"], fill=True, cmap="coolwarm", ax=ax, thresh=0.05)
-            ax.set_title(f"Pitch Location Heatmap: {player}")
+            sns.kdeplot(
+                x=df["plate_x"],
+                y=df["plate_z"],
+                fill=True,
+                cmap="coolwarm",
+                thresh=0.05,
+                ax=ax
+            )
+            ax.set_title(player)
             st.pyplot(fig)
 
 # ------------------------------------
-# Tab 5: Rolling xwOBA
+# Rolling xwOBA
 # ------------------------------------
 with tabs[4]:
-    st.subheader("Rolling xwOBA Tracker (20 PA Rolling)")
-    player = st.text_input("Enter Hitter Name for Rolling Graph")
+    st.subheader("Rolling xwOBA (20 PA)")
+
+    player = st.text_input("Player Name for Trend")
+
     if player:
-        df = get_statcast_data((today - datetime.timedelta(days=90)).strftime("%Y-%m-%d"),
-                               today.strftime("%Y-%m-%d"))
-        df_p = df[df["player_name"] == player]
-        if df_p.empty:
-            st.warning("No data found for that player.")
+        df = get_statcast_data(
+            (today - datetime.timedelta(days=90)).strftime("%Y-%m-%d"),
+            today.strftime("%Y-%m-%d")
+        )
+
+        df = df[df["player_name"] == player]
+
+        if df.empty:
+            st.warning("No data found.")
         else:
-            df_p["xwOBA_roll20"] = df_p["estimated_woba_using_speedangle"].rolling(20).mean()
-            st.line_chart(df_p.set_index("game_date")["xwOBA_roll20"])
+            df["xwOBA_rolling"] = df["estimated_woba_using_speedangle"].rolling(20).mean()
+            st.line_chart(df.set_index("game_date")["xwOBA_rolling"])
 
 # ------------------------------------
-# Tab 6: Home Runs Analyzer
+# Home Runs Tab
 # ------------------------------------
 with tabs[5]:
     st.subheader("Home Run Analyzer")
-    start_date = st.date_input("Start Date", today - datetime.timedelta(days=7))
-    end_date = st.date_input("End Date", today)
 
-    if st.button("Analyze Home Runs"):
-        data = get_statcast_data(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-        hr = data[data["events"] == "home_run"]
+    start = st.date_input("Start Date", today - datetime.timedelta(days=7))
+    end = st.date_input("End Date", today)
+
+    if st.button("Analyze"):
+        df = get_statcast_data(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+
+        hr = df[df["events"] == "home_run"]
 
         if hr.empty:
-            st.warning("No home runs found in this range.")
+            st.warning("No HRs found.")
         else:
-            st.success(f"{len(hr)} home runs found.")
+            st.success(f"{len(hr)} home runs")
+
             st.dataframe(
-                hr[["batter_name", "pitcher_name", "launch_speed", "launch_angle", "events"]],
+                hr[["player_name", "pitcher", "launch_speed", "launch_angle"]],
                 use_container_width=True
             )
-            st.subheader("Launch Angle vs Exit Velocity (Home Runs)")
+
             st.scatter_chart(hr, x="launch_angle", y="launch_speed")
