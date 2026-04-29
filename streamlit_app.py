@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
-
 from pybaseball import statcast
 import plotly.express as px
 import plotly.graph_objects as go
