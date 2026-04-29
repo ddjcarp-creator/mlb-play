@@ -5,19 +5,19 @@ import datetime
 from pybaseball import statcast
 
 st.set_page_config(layout="wide")
-st.title("⚾ MLB Statcast Engine v2 (Advanced Analytics)")
+st.title("⚾ MLB Statcast Engine v3 (Stable Build)")
 
 today = datetime.date.today()
 
 # =========================================================
-# DATA LOAD
+# LOAD DATA
 # =========================================================
 @st.cache_data(ttl=3600)
 def load_data(start, end):
     return statcast(start_dt=start, end_dt=end)
 
 # =========================================================
-# PLAYER ENTITY SYSTEM (CRITICAL FIX)
+# PLAYER ENTITY LAYER (FIXED)
 # =========================================================
 def build_entities(df):
     df = df.copy()
@@ -39,8 +39,8 @@ def enrich(df):
     df["barrel"] = df["launch_speed_angle"] == 6
     df["hard_hit"] = df["launch_speed"] >= 95
 
-    swings = ["swinging_strike","swinging_strike_blocked","foul","hit_into_play"]
-    df["swing"] = df["description"].isin(swings)
+    swing_events = ["swinging_strike","swinging_strike_blocked","foul","hit_into_play"]
+    df["swing"] = df["description"].isin(swing_events)
     df["whiff"] = df["description"].isin(["swinging_strike","swinging_strike_blocked"])
 
     df["in_zone"] = df["plate_x"].between(-0.83,0.83) & df["plate_z"].between(1.5,3.5)
@@ -56,7 +56,6 @@ def enrich(df):
     df["k"] = df["events"] == "strikeout"
     df["bb"] = df["events"] == "walk"
 
-    # HR probability model
     ev = df["launch_speed"].fillna(0)
     la = df["launch_angle"].fillna(0)
 
@@ -75,11 +74,11 @@ PARK_FACTORS = {
     "Oracle Park": 0.88
 }
 
-def environment(df, park="Neutral", temp=75, wind=5):
+def apply_environment(df, park="Neutral", temp=75, wind=5):
     df = df.copy()
 
     park_factor = PARK_FACTORS.get(park, 1.0)
-    weather_factor = (1 + (temp - 70)*0.003) * (1 + wind*0.01)
+    weather_factor = (1 + (temp - 70) * 0.003) * (1 + wind * 0.01)
 
     df["env_factor"] = park_factor * weather_factor
     df["hr_prob_adj"] = df["hr_prob"] * df["env_factor"]
@@ -87,13 +86,12 @@ def environment(df, park="Neutral", temp=75, wind=5):
     return df
 
 # =========================================================
-# METRICS - HITTERS
+# METRICS
 # =========================================================
 def hitters(df):
     return df.groupby("batter_name").apply(lambda x: pd.Series({
 
         "PA": len(x),
-
         "AVG": x["hit"].mean(),
         "HR": x["hr"].sum(),
 
@@ -113,9 +111,6 @@ def hitters(df):
 
     })).round(3)
 
-# =========================================================
-# METRICS - PITCHERS
-# =========================================================
 def pitchers(df):
     return df.groupby("pitcher_name").apply(lambda x: pd.Series({
 
@@ -135,26 +130,26 @@ def pitchers(df):
     })).round(3)
 
 # =========================================================
-# DFS PROJECTIONS
+# DFS MODEL
 # =========================================================
 def dfs(df):
     h = hitters(df)
 
-    h["Proj"] = (
-        h["HR"]*10 +
-        h["Barrel %"]*15 +
-        h["BB %"]*2 +
-        h["HR Prob"]*20
+    h["Projection"] = (
+        h["HR"] * 10 +
+        h["Barrel %"] * 15 +
+        h["BB %"] * 2 +
+        h["HR Prob"] * 20
     )
 
-    h["Ceiling"] = h["HR Prob"]*30 + h["Hard Hit %"]*10
+    h["Ceiling"] = h["HR Prob"] * 30 + h["Hard Hit %"] * 10
 
-    return h.sort_values("Proj", ascending=False)
+    return h.sort_values("Projection", ascending=False)
 
 # =========================================================
-# COLOR ENGINE
+# SAFE COLOR SYSTEM (NO STYLER BUGS)
 # =========================================================
-def color(val, inverse=False):
+def color_value(val, inverse=False):
     if pd.isna(val):
         return ""
 
@@ -172,7 +167,7 @@ def color(val, inverse=False):
         return "background-color:#ff4d4d"
 
 # =========================================================
-# SIDEBAR
+# UI
 # =========================================================
 st.sidebar.header("Filters")
 
@@ -191,7 +186,7 @@ min_pa = st.sidebar.slider("Min PA", 0, 200, 20)
 df = load_data(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
 df = build_entities(df)
 df = enrich(df)
-df = environment(df, park, temp, wind)
+df = apply_environment(df, park, temp, wind)
 
 # =========================================================
 # TABS
@@ -203,23 +198,13 @@ with tabs[0]:
     h = hitters(df)
     h = h[h["PA"] >= min_pa]
 
-    styled = h.style.applymap(lambda v: color(v, False),
-                              subset=["Barrel %","Hard Hit %","HR Prob","xwOBA"]).applymap(
-                              lambda v: color(v, True),
-                              subset=["K %","Whiff %","Chase %"])
-
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(h.sort_values("HR Prob", ascending=False), use_container_width=True)
 
 # ---------------- PITCHERS ----------------
 with tabs[1]:
     p = pitchers(df)
 
-    styled = p.style.applymap(lambda v: color(v, False),
-                              subset=["K %","Whiff %"]).applymap(
-                              lambda v: color(v, True),
-                              subset=["BB %","Barrel % Allowed"])
-
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(p.sort_values("K %", ascending=False), use_container_width=True)
 
 # ---------------- DFS ----------------
 with tabs[2]:
@@ -227,8 +212,11 @@ with tabs[2]:
 
 # ---------------- MATCHUPS ----------------
 with tabs[3]:
-    b = st.selectbox("Batter", df["batter_name"].dropna().unique())
-    p = st.selectbox("Pitcher", df["pitcher_name"].dropna().unique())
+    batters = df["batter_name"].dropna().unique()
+    pitchers_list = df["pitcher_name"].dropna().unique()
+
+    b = st.selectbox("Batter", sorted(batters))
+    p = st.selectbox("Pitcher", sorted(pitchers_list))
 
     m = df[(df["batter_name"]==b)&(df["pitcher_name"]==p)]
 
