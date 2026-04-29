@@ -1,241 +1,133 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import datetime
-from pybaseball import statcast
+import joblib
+import os
 
-st.set_page_config(layout="wide")
-st.title("⚾ MLB Statcast Engine v3 (Stable Build)")
+from pybaseball import statcast_batter, statcast_pitcher
+from sklearn.linear_model import LogisticRegression
 
-today = datetime.date.today()
+# ----------------------------
+# PAGE CONFIG
+# ----------------------------
+st.set_page_config(page_title="MLB Matchup Analyzer", layout="wide")
 
-# =========================================================
-# LOAD DATA
-# =========================================================
-@st.cache_data(ttl=3600)
-def load_data(start, end):
-    return statcast(start_dt=start, end_dt=end)
+st.title("⚾ MLB Pitcher vs Batter Analyzer")
+st.write("Statcast-powered matchup insights + HR probability model")
 
-# =========================================================
-# PLAYER ENTITY LAYER (FIXED)
-# =========================================================
-def build_entities(df):
-    df = df.copy()
+# ----------------------------
+# LOAD / TRAIN MODEL
+# ----------------------------
+MODEL_PATH = "hr_model.pkl"
 
-    batter_map = df.dropna(subset=["player_name","batter"]).drop_duplicates("batter")
-    pitcher_map = df.dropna(subset=["player_name","pitcher"]).drop_duplicates("pitcher")
+@st.cache_resource
+def train_model():
+    st.write("Training HR model (first run only)...")
 
-    df["batter_name"] = df["batter"].map(dict(zip(batter_map["batter"], batter_map["player_name"])))
-    df["pitcher_name"] = df["pitcher"].map(dict(zip(pitcher_map["pitcher"], pitcher_map["player_name"])))
+    data = statcast_batter("2024-04-01", "2024-10-01")
+    data = data.dropna(subset=["launch_speed", "launch_angle", "home_run"])
 
-    return df
+    X = data[["launch_speed", "launch_angle"]]
+    y = data["home_run"]
 
-# =========================================================
-# FEATURE ENGINEERING
-# =========================================================
-def enrich(df):
-    df = df.copy()
+    model = LogisticRegression()
+    model.fit(X, y)
 
-    df["barrel"] = df["launch_speed_angle"] == 6
-    df["hard_hit"] = df["launch_speed"] >= 95
+    joblib.dump(model, MODEL_PATH)
+    return model
 
-    swing_events = ["swinging_strike","swinging_strike_blocked","foul","hit_into_play"]
-    df["swing"] = df["description"].isin(swing_events)
-    df["whiff"] = df["description"].isin(["swinging_strike","swinging_strike_blocked"])
 
-    df["in_zone"] = df["plate_x"].between(-0.83,0.83) & df["plate_z"].between(1.5,3.5)
-    df["chase"] = df["swing"] & (~df["in_zone"])
+if os.path.exists(MODEL_PATH):
+    model = joblib.load(MODEL_PATH)
+else:
+    model = train_model()
 
-    df["hit"] = df["events"].isin(["single","double","triple","home_run"])
-    df["hr"] = df["events"] == "home_run"
+# ----------------------------
+# SIDEBAR INPUTS
+# ----------------------------
+st.sidebar.header("Player Inputs")
 
-    df["tb"] = df["events"].map({
-        "single":1,"double":2,"triple":3,"home_run":4
-    }).fillna(0)
+batter_id = st.sidebar.number_input("Batter ID", value=592450)
+pitcher_id = st.sidebar.number_input("Pitcher ID", value=425844)
 
-    df["k"] = df["events"] == "strikeout"
-    df["bb"] = df["events"] == "walk"
+# ----------------------------
+# MATCHUP ANALYSIS
+# ----------------------------
+if st.sidebar.button("Analyze Matchup"):
 
-    ev = df["launch_speed"].fillna(0)
-    la = df["launch_angle"].fillna(0)
+    with st.spinner("Pulling Statcast data..."):
 
-    df["hr_prob"] = 1 / (1 + np.exp(-(0.09*(ev-94) + 0.11*(la-22))))
+        try:
+            batter = statcast_batter("2024-04-01", "2024-10-01", player_id=batter_id)
+            pitcher = statcast_pitcher("2024-04-01", "2024-10-01", player_id=pitcher_id)
 
-    return df
+            col1, col2, col3 = st.columns(3)
 
-# =========================================================
-# ENVIRONMENT MODEL
-# =========================================================
-PARK_FACTORS = {
-    "Coors Field": 1.28,
-    "Yankee Stadium": 1.12,
-    "Fenway Park": 1.08,
-    "Dodger Stadium": 0.97,
-    "Oracle Park": 0.88
-}
+            with col1:
+                st.subheader("Batter Profile")
+                st.metric("Avg Exit Velocity", round(batter["launch_speed"].mean(), 2))
+                st.metric("Avg Launch Angle", round(batter["launch_angle"].mean(), 2))
+                st.metric("HR Rate", round(batter["home_run"].mean(), 3))
 
-def apply_environment(df, park="Neutral", temp=75, wind=5):
-    df = df.copy()
+            with col2:
+                st.subheader("Pitcher Profile")
+                st.metric("Avg Pitch Velocity", round(pitcher["release_speed"].mean(), 2))
+                st.metric("Strikeout Rate", round((pitcher["events"] == "strikeout").mean(), 3))
 
-    park_factor = PARK_FACTORS.get(park, 1.0)
-    weather_factor = (1 + (temp - 70) * 0.003) * (1 + wind * 0.01)
+            with col3:
+                st.subheader("Power Matchup Insight")
 
-    df["env_factor"] = park_factor * weather_factor
-    df["hr_prob_adj"] = df["hr_prob"] * df["env_factor"]
+                power_diff = batter["launch_speed"].mean() - pitcher["release_speed"].mean()
 
-    return df
+                st.metric("Power Differential", round(power_diff, 2))
 
-# =========================================================
-# METRICS
-# =========================================================
-def hitters(df):
-    return df.groupby("batter_name").apply(lambda x: pd.Series({
+                if power_diff > 5:
+                    st.success("High offensive matchup advantage")
+                elif power_diff > 0:
+                    st.info("Slight hitter advantage")
+                else:
+                    st.warning("Pitcher advantage")
 
-        "PA": len(x),
-        "AVG": x["hit"].mean(),
-        "HR": x["hr"].sum(),
+        except Exception as e:
+            st.error(f"Error loading data: {e}")
 
-        "EV": x["launch_speed"].mean(),
-        "Barrel %": x["barrel"].mean(),
-        "Hard Hit %": x["hard_hit"].mean(),
+# ----------------------------
+# HR PROBABILITY TOOL
+# ----------------------------
+st.divider()
+st.header("⚾ Home Run Probability Model")
 
-        "Whiff %": x["whiff"].sum()/x["swing"].sum() if x["swing"].sum() else 0,
-        "Chase %": x["chase"].mean(),
-        "K %": x["k"].mean(),
-        "BB %": x["bb"].mean(),
+col1, col2 = st.columns(2)
 
-        "HR Prob": x["hr_prob_adj"].mean(),
-        "xwOBA": x["estimated_woba_using_speedangle"].mean(),
+with col1:
+    launch_speed = st.slider("Exit Velocity (mph)", 50, 120, 95)
 
-        "ISO": (x["tb"].sum() - x["hit"].sum()) / len(x),
+with col2:
+    launch_angle = st.slider("Launch Angle (degrees)", -10, 60, 25)
 
-    })).round(3)
+if st.button("Calculate HR Probability"):
 
-def pitchers(df):
-    return df.groupby("pitcher_name").apply(lambda x: pd.Series({
+    prob = model.predict_proba([[launch_speed, launch_angle]])[0][1]
 
-        "Velo": x["release_speed"].mean(),
-        "Spin": x["release_spin_rate"].mean(),
+    st.subheader("Result")
+    st.metric("Home Run Probability", f"{prob:.3f}")
 
-        "K %": x["k"].mean(),
-        "BB %": x["bb"].mean(),
-        "Whiff %": x["whiff"].sum()/x["swing"].sum() if x["swing"].sum() else 0,
-
-        "Barrel % Allowed": x["barrel"].mean(),
-        "Hard Hit % Allowed": x["hard_hit"].mean(),
-
-        "HR Allowed": x["hr"].sum(),
-        "xwOBA Allowed": x["estimated_woba_using_speedangle"].mean(),
-
-    })).round(3)
-
-# =========================================================
-# DFS MODEL
-# =========================================================
-def dfs(df):
-    h = hitters(df)
-
-    h["Projection"] = (
-        h["HR"] * 10 +
-        h["Barrel %"] * 15 +
-        h["BB %"] * 2 +
-        h["HR Prob"] * 20
-    )
-
-    h["Ceiling"] = h["HR Prob"] * 30 + h["Hard Hit %"] * 10
-
-    return h.sort_values("Projection", ascending=False)
-
-# =========================================================
-# SAFE COLOR SYSTEM (NO STYLER BUGS)
-# =========================================================
-def color_value(val, inverse=False):
-    if pd.isna(val):
-        return ""
-
-    if inverse:
-        if val >= 0.25:
-            return "background-color:#ff4d4d"
-        elif val >= 0.18:
-            return "background-color:#ffa64d"
-        return "background-color:#2ecc71"
+    if prob > 0.5:
+        st.success("High HR likelihood")
+    elif prob > 0.2:
+        st.info("Moderate HR chance")
     else:
-        if val >= 0.25:
-            return "background-color:#2ecc71"
-        elif val >= 0.15:
-            return "background-color:#ffa64d"
-        return "background-color:#ff4d4d"
+        st.warning("Low HR probability")
 
-# =========================================================
-# UI
-# =========================================================
-st.sidebar.header("Filters")
+# ----------------------------
+# RAW DATA VIEWER (OPTIONAL)
+# ----------------------------
+st.divider()
+st.header("📊 Raw Statcast Snapshot")
 
-start = st.sidebar.date_input("Start", today - datetime.timedelta(days=30))
-end = st.sidebar.date_input("End", today)
-
-temp = st.sidebar.slider("Temp", 50, 100, 75)
-wind = st.sidebar.slider("Wind", 0, 20, 5)
-park = st.sidebar.selectbox("Park", list(PARK_FACTORS.keys()) + ["Neutral"])
-
-min_pa = st.sidebar.slider("Min PA", 0, 200, 20)
-
-# =========================================================
-# PIPELINE
-# =========================================================
-df = load_data(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-df = build_entities(df)
-df = enrich(df)
-df = apply_environment(df, park, temp, wind)
-
-# =========================================================
-# TABS
-# =========================================================
-tabs = st.tabs(["Hitters","Pitchers","DFS","Matchups","Compare"])
-
-# ---------------- HITTERS ----------------
-with tabs[0]:
-    h = hitters(df)
-    h = h[h["PA"] >= min_pa]
-
-    st.dataframe(h.sort_values("HR Prob", ascending=False), use_container_width=True)
-
-# ---------------- PITCHERS ----------------
-with tabs[1]:
-    p = pitchers(df)
-
-    st.dataframe(p.sort_values("K %", ascending=False), use_container_width=True)
-
-# ---------------- DFS ----------------
-with tabs[2]:
-    st.dataframe(dfs(df), use_container_width=True)
-
-# ---------------- MATCHUPS ----------------
-with tabs[3]:
-    batters = df["batter_name"].dropna().unique()
-    pitchers_list = df["pitcher_name"].dropna().unique()
-
-    b = st.selectbox("Batter", sorted(batters))
-    p = st.selectbox("Pitcher", sorted(pitchers_list))
-
-    m = df[(df["batter_name"]==b)&(df["pitcher_name"]==p)]
-
-    if m.empty:
-        st.warning("No matchup data")
-    else:
-        st.write({
-            "PA": len(m),
-            "Hits": m["hit"].sum(),
-            "HR": m["hr"].sum(),
-            "K%": m["k"].mean(),
-            "HR Prob": m["hr_prob_adj"].mean()
-        })
-
-# ---------------- COMPARE ----------------
-with tabs[4]:
-    players = df["batter_name"].dropna().unique()
-
-    p1 = st.selectbox("Player 1", players)
-    p2 = st.selectbox("Player 2", players)
-
-    st.dataframe(hitters(df).loc[[p1,p2]])
+if st.checkbox("Show Batter Data Sample"):
+    try:
+        sample = statcast_batter("2024-04-01", "2024-04-05", player_id=batter_id)
+        st.dataframe(sample.head(20))
+    except:
+        st.warning("No data available for this player/sample range")
